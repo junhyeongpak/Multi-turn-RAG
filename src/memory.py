@@ -1,22 +1,23 @@
 """
-세션별 in-memory chat history.
-프로덕션에서는 Redis/SQL 백엔드로 교체.
+LangGraph 용 체크포인터 (세션별 state 저장소).
+
+- InMemorySaver : 프로세스 재시작 시 날아감 (데모/테스트용)
+- SqliteSaver   : 파일로 영속화 (프로덕션은 Postgres 등으로 교체)
+
+pipeline.py 는 get_checkpointer() 하나만 호출하면 된다.
 """
 
-from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from functools import lru_cache
 
-_session_store: dict[str, BaseChatMessageHistory] = {}
-
-
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    if session_id not in _session_store:
-        _session_store[session_id] = InMemoryChatMessageHistory()
-    return _session_store[session_id]
+from langgraph.checkpoint.memory import InMemorySaver
 
 
-def reset_session(session_id: str) -> None:
-    _session_store.pop(session_id, None)
+@lru_cache(maxsize=1)
+def get_checkpointer() -> InMemorySaver:
+    """세션 state를 보관하는 체크포인터 (싱글톤)."""
+    return InMemorySaver()
 
 
-def list_sessions() -> list[str]:
-    return list(_session_store.keys())
+def reset_all() -> None:
+    """전체 세션 초기화 (캐시된 saver를 버림)."""
+    get_checkpointer.cache_clear()
