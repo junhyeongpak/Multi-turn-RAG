@@ -1,0 +1,24 @@
+# core
+torch>=2.2.0
+transformers>=4.40.0
+sentence-transformers>=3.0.0
+accelerate>=0.29.0
+tqdm>=4.66.0
+
+# quantization (Qwen3-8B 4bit)
+bitsandbytes>=0.43.0
+sentencepiece>=0.2.0
+
+# elasticsearch
+elasticsearch>=8.12.0
+
+# langchain stack
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+langchain-huggingface>=0.0.3
+
+# env / utils
+python-dotenv>=1.0.0
+pandas>=2.0.0
+numpy>=1.24.0

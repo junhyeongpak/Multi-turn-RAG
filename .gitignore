@@ -1,0 +1,32 @@
+# env / secrets
+.env
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# data (대용량 / 비공개)
+data/raw/*
+data/processed/*
+data/eval/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/eval/.gitkeep
+
+# outputs
+outputs/logs/*
+outputs/results/*
+!outputs/logs/.gitkeep
+!outputs/results/.gitkeep
+
+# notebooks
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
