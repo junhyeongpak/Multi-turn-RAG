@@ -12,11 +12,14 @@ sentencepiece>=0.2.0
 # elasticsearch
 elasticsearch>=8.12.0
 
-# langchain stack
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-openai>=0.1.0
-langchain-huggingface>=0.0.3
+# langchain / langgraph stack
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-huggingface>=0.1.0
+langgraph>=0.2.50
+langgraph-checkpoint>=2.0.0
+langmem>=0.0.10
 
 # env / utils
 python-dotenv>=1.0.0
