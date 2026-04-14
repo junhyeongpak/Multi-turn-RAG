@@ -13,10 +13,9 @@ venv/
 # data (대용량 / 비공개)
 data/raw/*
 data/processed/*
-data/eval/*
+
 !data/raw/.gitkeep
 !data/processed/.gitkeep
-!data/eval/.gitkeep
 
 # outputs
 outputs/logs/*
