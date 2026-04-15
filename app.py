@@ -20,7 +20,7 @@ if "conversations" not in st.session_state:
 
 # sidebar
 with st.sidebar:
-    st.header("Settings")
+    st.header("Mode for Retrieval")
     retrieval_mode = st.selectbox("Retrieval mode", RETRIEVAL_MODES)
 
     if st.button("New conversation"):
