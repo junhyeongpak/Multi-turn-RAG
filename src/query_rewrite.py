@@ -1,9 +1,8 @@
-"""
-멀티턴 대화 → standalone 쿼리 재작성 체인.
-OpenAI(gpt-4o-mini) 사용. 출력은 JSON 파싱하여 'reworded version' 만 반환.
-"""
+from __future__ import annotations
 
 import json
+import re
+from typing import Any
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -12,32 +11,138 @@ from langchain_openai import ChatOpenAI
 
 from src.config import REWRITE_MODEL, REWRITE_TEMPERATURE
 
-REWRITE_SYSTEM = """Given the following conversation, please reword the final utterance from the user into a single utterance that does not need the history to understand the user's intent. Output in proper JSON format indicating the "class" (standalone or non-standalone) and the "reworded version" of the last utterance. Use this format: {{"class": "type of last utterance", "reworded version": "the last utterance rewritten into a standalone question, IF NEEDED"}}.
 
-In your rewording of the last utterance, do not do any unnecessary rephrasing or introduction of new terms or concepts that were not mentioned in the prior part of the conversation. Be minimal, by staying as close as possible to the shape and meaning of the last user utterance. If the last user utterance is already clear and standalone, the reworded version should be THE SAME as the last user utterance, and the class should be 'standalone'."""
+REWRITE_SYSTEM = """You are a query rewriting assistant.
+
+Given the following conversation, reword the final user utterance into a single utterance that does not need the conversation history to understand the user's intent.
+
+Return valid JSON only with this schema:
+{{
+  "class": "standalone" | "non-standalone",
+  "reworded version": "<the last utterance rewritten into a standalone question, IF NEEDED>"
+}}
+
+Rewriting rules:
+- Be MINIMAL. Stay as close as possible to the shape and meaning of the last user utterance.
+- Do NOT introduce new terms or concepts that were not mentioned earlier in the conversation.
+- Do NOT do unnecessary rephrasing.
+- Only resolve coreferences, ellipses, or ambiguity using the prior conversation.
+- The output should be a natural-language question/utterance, NOT a keyword search query.
+- If the last user utterance is already clear and standalone, set "class" to "standalone" and return the utterance UNCHANGED in "reworded version".
+- Otherwise, set "class" to "non-standalone".
+
+Output rules:
+- Output JSON only. No markdown code fences. No explanations. Do not answer the question.
+
+Examples:
+Conversation:
+User: Who is the CEO of Apple Inc.?
+Agent: The CEO of Apple Inc. is Tim Cook.
+User: its address?
+Output: {{"class": "non-standalone", "reworded version": "What is the address of Apple Inc.?"}}
+
+Conversation:
+User: What is the capital of France?
+Output: {{"class": "standalone", "reworded version": "What is the capital of France?"}}
+"""
 
 
-def parse_rewrite_json(raw: str) -> str:
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def _extract_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _last_question_like_span(text: str) -> str:
+    cleaned = " ".join(text.strip().split())
+    if not cleaned:
+        return ""
+
+    parts = re.split(r"(?<=[?.!])\s+", cleaned)
+    question_parts = [p.strip() for p in parts if "?" in p]
+    if question_parts:
+        return question_parts[-1]
+
+    short_parts = [p.strip() for p in parts if 0 < len(p.strip()) <= 160]
+    if short_parts:
+        return short_parts[-1]
+
+    return cleaned[:160].strip()
+
+
+def _sanitize_query(candidate: str, original_input: str) -> str:
+    candidate = " ".join((candidate or "").split()).strip()
+    original_input = " ".join((original_input or "").split()).strip()
+
+    if not candidate:
+        return original_input
+
+    if len(candidate) > 220:
+        shortened = _last_question_like_span(candidate)
+        return shortened or original_input
+
+    return candidate
+
+
+def parse_rewrite_output(payload: dict[str, Any]) -> dict[str, str]:
+    raw = str(payload.get("raw", "") or "").strip()
+    last_input = str(payload.get("last_input", "") or "").strip()
+
+    cleaned = _strip_code_fences(raw)
+    json_candidate = _extract_json_object(cleaned) or cleaned
+
+    rewrite_class = "standalone"
+    rewritten_query = last_input
+
     try:
-        cleaned = (
-            raw.strip()
-            .removeprefix("```json")
-            .removeprefix("```")
-            .removesuffix("```")
-            .strip()
-        )
-        parsed = json.loads(cleaned)
-        reworded = parsed.get("reworded version", "").strip()
-        cls = parsed.get("class", "").strip()
-        print(f"[재작성 결과] class={cls}, query={reworded}")
-        return reworded if reworded else raw
+        parsed = json.loads(json_candidate)
+
+        if isinstance(parsed, dict):
+            rewrite_class = str(parsed.get("class", "standalone")).strip() or "standalone"
+            reworded = str(parsed.get("reworded version", "")).strip()
+            rewritten_query = _sanitize_query(reworded, last_input)
+        else:
+            rewritten_query = _sanitize_query(cleaned, last_input)
+
     except Exception as e:
-        print(f"[경고] JSON 파싱 실패 ({e}), 원문 사용")
-        return raw
+        rewritten_query = _sanitize_query(cleaned, last_input)
+        print(f"[WARN] Failed to parse rewrite JSON ({e}); using safe fallback.")
+
+    print(f"[Rewrite Result] class={rewrite_class}, query={rewritten_query}")
+
+    return {
+        "rewritten_query": rewritten_query,
+        "rewrite_class": rewrite_class,
+        "rewrite_raw": raw,
+    }
 
 
 def build_rewrite_chain() -> Runnable:
-    llm = ChatOpenAI(model=REWRITE_MODEL, temperature=REWRITE_TEMPERATURE)
+    # response_format=json_object 로 OpenAI JSON mode 강제 → 항상 valid JSON 반환
+    llm = ChatOpenAI(
+        model=REWRITE_MODEL,
+        temperature=REWRITE_TEMPERATURE,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
+
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", REWRITE_SYSTEM),
@@ -45,4 +150,11 @@ def build_rewrite_chain() -> Runnable:
             ("human", "{input}"),
         ]
     )
-    return prompt | llm | StrOutputParser() | RunnableLambda(parse_rewrite_json)
+
+    return (
+        {
+            "raw": prompt | llm | StrOutputParser(),
+            "last_input": lambda x: x["input"],
+        }
+        | RunnableLambda(parse_rewrite_output)
+    )

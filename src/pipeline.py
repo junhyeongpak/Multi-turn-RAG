@@ -1,71 +1,53 @@
-"""
-멀티턴 RAG 파이프라인 (LangGraph 버전).
-
-흐름:
-  START
-    → summarize_node   (langmem: 대화가 길어지면 오래된 부분 자동 요약)
-    → rewrite_node     (멀티턴 → standalone 쿼리, gpt-4o-mini)
-    → retrieve_node    (ES hybrid: dense + BM25 RRF)
-    → generate_node    (Qwen3-8B 4bit, 검색 문서 기반 답변)
-    → END
-
-세션 영속성은 MemorySaver (checkpointer) 가 담당. thread_id 별로 state 유지.
-"""
+from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, TypedDict
 
 import torch
-from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langmem.short_term import SummarizationNode
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
-from typing_extensions import TypedDict
 
 from src.config import (
     ANSWER_MAX_NEW_TOKENS,
     ANSWER_MODEL_ID,
     ANSWER_TEMPERATURE,
     DEFAULT_RETRIEVAL_MODE,
-    REWRITE_MODEL,
-    REWRITE_TEMPERATURE,
     TOP_K,
 )
 from src.memory import get_checkpointer
 from src.query_rewrite import build_rewrite_chain
 from src.retriever import retrieve_as_context
 
-ANSWER_SYSTEM = """You are an assistant that answers questions based on the provided documents.
-Use the retrieved documents below to answer the user's question accurately.
-Do not make up information that is not in the documents. If the answer is not in the documents, say you don't know.
-Always answer in English.
 
-[Retrieved Documents]
-{context}"""
+ANSWER_SYSTEM = """You are a helpful assistant answering questions using retrieved documents.
+
+Answer the user's question using only the retrieved documents below.
+Do not make up facts.
+If the answer cannot be found in the retrieved documents, say: "I don't know."
+
+Retrieved documents:
+{context}
+"""
 
 
-# ---------- State ----------
-class RAGState(TypedDict):
-    """그래프 전체가 공유하는 상태."""
-
-    messages: Annotated[list[AnyMessage], add_messages]
-    # langmem 이 요약 캐시를 넣어주는 자리 (필수 키)
-    context: dict
-    # 노드 간 전달용
+class GraphState(TypedDict, total=False):
+    input: str
+    messages: Annotated[list[BaseMessage], add_messages]
     rewritten_query: str
-    retrieved_context: str
+    rewrite_class: str
+    rewrite_raw: str
+    context: str
+    generated_answer: str
 
 
-# ---------- LLM 로더 ----------
 @lru_cache(maxsize=1)
 def load_answer_llm() -> ChatHuggingFace:
-    """Qwen3-8B 4bit 싱글톤."""
     if not torch.cuda.is_available():
-        raise EnvironmentError("CUDA GPU 환경이 필요합니다.")
+        raise EnvironmentError("CUDA GPU is required.")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -83,12 +65,11 @@ def load_answer_llm() -> ChatHuggingFace:
         dtype=torch.bfloat16,
     )
 
-    # Qwen3 thinking 모드 끔
-    _orig_apply = tokenizer.apply_chat_template
+    original_apply_chat_template = tokenizer.apply_chat_template
 
     def _apply_no_think(*args, **kwargs):
         kwargs.setdefault("enable_thinking", False)
-        return _orig_apply(*args, **kwargs)
+        return original_apply_chat_template(*args, **kwargs)
 
     tokenizer.apply_chat_template = _apply_no_think
 
@@ -107,117 +88,79 @@ def load_answer_llm() -> ChatHuggingFace:
         eos_token_id=eos_ids,
         pad_token_id=tokenizer.eos_token_id,
     )
+
     base_llm = HuggingFacePipeline(pipeline=gen_pipeline)
     return ChatHuggingFace(llm=base_llm, tokenizer=tokenizer)
 
 
-@lru_cache(maxsize=1)
-def _get_rewrite_chain():
-    return build_rewrite_chain()
-
-
-@lru_cache(maxsize=1)
-def _get_summarization_node() -> SummarizationNode:
-    """
-    langmem 공식 summarization 노드.
-    - max_tokens: 이 토큰 넘으면 오래된 메시지를 요약해 SystemMessage 로 대체
-    - max_summary_tokens: 요약 자체의 상한
-    """
-    summarizer_llm = ChatOpenAI(model=REWRITE_MODEL, temperature=REWRITE_TEMPERATURE)
-    return SummarizationNode(
-        model=summarizer_llm,
-        max_tokens=1024,
-        max_summary_tokens=256,
-    )
-
-
-# ---------- 노드들 ----------
-def rewrite_node(state: RAGState) -> dict:
-    """마지막 human 메시지를 standalone 쿼리로 변환."""
-    msgs = state["messages"]
-    last_human = next((m for m in reversed(msgs) if isinstance(m, HumanMessage)), None)
-    if last_human is None:
-        return {"rewritten_query": ""}
-
-    # 첫 턴이면 스킵
-    prior = [m for m in msgs if m is not last_human]
-    if not prior:
-        print(f"[스킵] 첫 턴이라 재작성 생략: {last_human.content}")
-        return {"rewritten_query": last_human.content}
-
-    rewritten = _get_rewrite_chain().invoke(
-        {"input": last_human.content, "chat_history": prior}
-    )
-    return {"rewritten_query": rewritten}
-
-
-def make_retrieve_node(retrieval_mode: str, top_k: int):
-    def retrieve_node(state: RAGState) -> dict:
-        q = state["rewritten_query"]
-        print(f"[검색 쿼리] ({retrieval_mode}) {q}")
-        ctx = retrieve_as_context(q, mode=retrieval_mode, top_k=top_k)
-        return {"retrieved_context": ctx}
-
-    return retrieve_node
-
-
-def generate_node(state: RAGState) -> dict:
-    """Qwen3-8B로 최종 답변 생성."""
-    prompt = ChatPromptTemplate.from_messages(
+def _build_answer_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages(
         [
             ("system", ANSWER_SYSTEM),
             MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
         ]
     )
-    llm = load_answer_llm()
-    chain = prompt | llm
-
-    # summarize_node 가 요약한 메시지 리스트를 우선 사용
-    summarized_msgs = state.get("context", {}).get("summarized_messages")
-    history: list[BaseMessage] = summarized_msgs or state["messages"]
-
-    result = chain.invoke(
-        {"context": state["retrieved_context"], "chat_history": history}
-    )
-    answer = result.content if hasattr(result, "content") else str(result)
-    return {"messages": [AIMessage(content=answer)]}
 
 
-# ---------- 그래프 빌드 ----------
-@lru_cache(maxsize=4)
-def build_graph(retrieval_mode: str = DEFAULT_RETRIEVAL_MODE, top_k: int = TOP_K):
-    graph = StateGraph(RAGState)
+def build_graph(
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
+    top_k: int = TOP_K,
+):
+    rewrite_chain = build_rewrite_chain()
+    answer_prompt = _build_answer_prompt()
+    answer_llm = load_answer_llm()
+    answer_chain = answer_prompt | answer_llm
 
-    graph.add_node("summarize", _get_summarization_node())
-    graph.add_node("rewrite", rewrite_node)
-    graph.add_node("retrieve", make_retrieve_node(retrieval_mode, top_k))
-    graph.add_node("generate", generate_node)
+    def answer_turn(state: GraphState) -> GraphState:
+        history = list(state.get("messages", []))
+        original_input = state["input"]
 
-    graph.add_edge(START, "summarize")
-    graph.add_edge("summarize", "rewrite")
-    graph.add_edge("rewrite", "retrieve")
-    graph.add_edge("retrieve", "generate")
-    graph.add_edge("generate", END)
+        if not history:
+            rewritten_query = original_input
+            rewrite_class = "standalone"
+            rewrite_raw = original_input
+            print(f"[Skip] First turn, no rewriting: {rewritten_query}")
+        else:
+            rewrite_result = rewrite_chain.invoke(
+                {
+                    "input": original_input,
+                    "chat_history": history,
+                }
+            )
+            rewritten_query = rewrite_result.get("rewritten_query", original_input)
+            rewrite_class = rewrite_result.get("rewrite_class", "standalone")
+            rewrite_raw = rewrite_result.get("rewrite_raw", original_input)
 
-    return graph.compile(checkpointer=get_checkpointer())
+        print(f"[Search Query] ({retrieval_mode}) {rewritten_query}")
+        context = retrieve_as_context(rewritten_query, mode=retrieval_mode, top_k=top_k)
 
+        answer = answer_chain.invoke(
+            {
+                "input": original_input,
+                "chat_history": history,
+                "context": context,
+            }
+        )
 
-# ---------- 공개 API ----------
-def ask(question: str, session_id: str = "default", retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
-        top_k: int = TOP_K) -> str:
-    """한 턴 실행. 같은 session_id 로 연속 호출하면 멀티턴."""
-    app = build_graph(retrieval_mode=retrieval_mode, top_k=top_k)
-    config = {"configurable": {"thread_id": session_id}}
-    out = app.invoke({"messages": [HumanMessage(content=question)]}, config=config)
-    return out["messages"][-1].content
+        generated_answer = getattr(answer, "content", str(answer))
+        ai_message = answer if isinstance(answer, AIMessage) else AIMessage(content=generated_answer)
 
+        return {
+            "messages": [
+                HumanMessage(content=original_input),
+                ai_message,
+            ],
+            "generated_answer": generated_answer,
+            "rewritten_query": rewritten_query,
+            "rewrite_class": rewrite_class,
+            "rewrite_raw": rewrite_raw,
+            "context": context,
+        }
 
-# ---------- 데모 ----------
-if __name__ == "__main__":
-    print("=" * 60, "\n[Turn 1]")
-    r1 = ask("What's the difference between Market Cap and NAV?", session_id="user_002")
-    print(f"\n[답변]\n{r1}\n")
+    workflow = StateGraph(GraphState)
+    workflow.add_node("answer_turn", answer_turn)
+    workflow.add_edge(START, "answer_turn")
+    workflow.add_edge("answer_turn", END)
 
-    print("=" * 60, "\n[Turn 2]")
-    r2 = ask("Which is more important?", session_id="user_002")
-    print(f"\n[답변]\n{r2}\n")
+    return workflow.compile(checkpointer=get_checkpointer())
