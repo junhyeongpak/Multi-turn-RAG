@@ -12,7 +12,6 @@ venv/
 
 # data (대용량 / 비공개)
 data/raw/*
-data/processed/*
 
 !data/raw/.gitkeep
 !data/processed/.gitkeep
