@@ -36,6 +36,7 @@ Retrieved documents:
 
 class GraphState(TypedDict, total=False):
     input: str
+    retrieval_mode: str #이전거 돌리고 싶음 이거 주석처리 하면 되긴 함!
     messages: Annotated[list[BaseMessage], add_messages]
     rewritten_query: str
     rewrite_class: str
@@ -132,8 +133,11 @@ def build_graph(
             rewrite_class = rewrite_result.get("rewrite_class", "standalone")
             rewrite_raw = rewrite_result.get("rewrite_raw", original_input)
 
-        print(f"[Search Query] ({retrieval_mode}) {rewritten_query}")
-        context = retrieve_as_context(rewritten_query, mode=retrieval_mode, top_k=top_k)
+        #print(f"[Search Query] ({retrieval_mode}) {rewritten_query}")
+        #context = retrieve_as_context(rewritten_query, mode=retrieval_mode, top_k=top_k)
+        mode = state.get("retrieval_mode") or retrieval_mode
+        print(f"[Search Query] ({mode}) {rewritten_query}")
+        context = retrieve_as_context(rewritten_query, mode=mode, top_k=top_k)
 
         answer = answer_chain.invoke(
             {
